@@ -1,204 +1,259 @@
 from time import time
+from time import time
 from typing import List, Union, Tuple
 
 import numpy as np
+import torch
 
-print("bboxes is being used here")
 
-def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride=(16, 16, 16), margin=(10, 10, 10), max_depth=5, current_depth=0):
+from time import time
+from typing import List, Union, Tuple
+
+import numpy as np
+import torch
+
+
+def generate_bounding_boxes(
+        mask: torch.Tensor,
+        bbox_size=(192, 192, 192),
+        stride: Union[List[int], Tuple[int, int, int], str] = (16, 16, 16),
+        margin=(10, 10, 10),
+        max_depth: int = 5,
+        current_depth: int = 0
+) -> List:
     """
-    Generate overlapping bounding boxes to cover a 3D binary segmentation mask using PyTorch tensors.
+    Generate a covering set of bounding boxes over a 3D binary mask using a
+    greedy set-cover algorithm.
 
-    Parameters:
-    - mask: 3D PyTorch tensor with values 0 or 1 (binary mask)
-    - bbox_size: Tuple or list of three integers specifying the size of bounding boxes per dimension (x, y, z)
-    - stride: Tuple or list of three integers specifying the stride for subsampling centers per dimension
-    - margin: Tuple or list of three integers specifying the margin to leave uncovered per dimension
-    - max_depth: Maximum recursion depth to prevent infinite recursion
-    - current_depth: Current recursion depth (used internally)
+    Parameters
+    ----------
+    mask : torch.Tensor
+        3D binary tensor (uint8 or bool). Non-zero voxels are the target region.
+    bbox_size : tuple of int
+        Size of each bounding box in (x, y, z).
+    stride : tuple of int or 'auto'
+        Spacing between candidate centers. 'auto' derives stride from object extent.
+    margin : tuple of int
+        Coverage margin — voxels within this margin of the box edge are not marked
+        as covered, ensuring meaningful overlap between adjacent boxes.
+    max_depth : int
+        Maximum recursion depth for covering residual voxels.
+    current_depth : int
+        Current recursion depth (used internally).
 
-    Returns:
-    - List of tuples [(min_coords, max_coords), ...], where min_coords and max_coords are lists [x, y, z] defining each box
-      as a half-open interval [min_coords, max_coords).
+    Returns
+    -------
+    List of [[x0,x1],[y0,y1],[z0,z1]] bounding boxes as half-open intervals.
     """
-    # Prevent infinite recursion
+    # Early exit if mask is empty.
+    if not torch.any(mask):
+        return []
+
+    # Prevent infinite recursion.
     if current_depth > max_depth:
-        # print('random fallback due to max recursion depth')
-        return random_sampling_fallback(mask, bbox_size, margin, 25)
+        return random_sampling_fallback(mask, bbox_size, margin, n_samples=25)
 
-    # Ensure bbox_size, stride, and margin are lists
     bbox_size = list(bbox_size)
     margin = list(margin)
 
-    # Compute half sizes for each dimension
-    half_size = [bs // 2 for bs in bbox_size]
-    # Adjust end offsets to ensure full bbox_size (handles odd sizes)
-    end_offset = [bs - hs for bs, hs in zip(bbox_size, half_size)]  # e.g., 193 - 96 = 97
+    half_size  = [bs // 2 for bs in bbox_size]
+    end_offset = [bs - hs for bs, hs in zip(bbox_size, half_size)]
 
-    # Find all object voxels
-    object_voxels = np.argwhere(mask)
-    if object_voxels.size == 0:
+    object_voxels = torch.nonzero(mask, as_tuple=False)
+    if object_voxels.numel() == 0:
         return []
 
-    # Compute the object's bounding box to limit potential centers
-    min_coords = np.min(object_voxels, axis=0)
-    max_coords = np.max(object_voxels, axis=0)
+    min_coords = object_voxels.min(dim=0)[0]
+    max_coords = object_voxels.max(dim=0)[0]
 
-    if stride == 'auto':
-        stride = [max(1, round((j - i) / 4)) for i, j in zip(min_coords, max_coords)]
-
+    if isinstance(stride, str) and stride == 'auto':
+        stride = [
+            max(1, round((j.item() - i.item()) / 4))
+            for i, j in zip(min_coords, max_coords)
+        ]
     stride = list(stride)
-    # print('stride', stride)
-    # print('bbox', [[i, j] for i, j in zip(min_coords, max_coords)])
 
-    # Generate potential centers within the object's bounding box
+    # Build candidate centers: grid points inside the mask.
     potential_centers = []
-    for x in range(max(0, min_coords[0]), min(mask.shape[0], max_coords[0] + 1), stride[0]):
-        for y in range(max(0, min_coords[1]), min(mask.shape[1], max_coords[1] + 1), stride[1]):
-            for z in range(max(0, min_coords[2]), min(mask.shape[2], max_coords[2] + 1), stride[2]):
+    for x in range(min_coords[0].item(), min(mask.shape[0], max_coords[0].item() + 1), stride[0]):
+        for y in range(min_coords[1].item(), min(mask.shape[1], max_coords[1].item() + 1), stride[1]):
+            for z in range(min_coords[2].item(), min(mask.shape[2], max_coords[2].item() + 1), stride[2]):
                 if mask[x, y, z]:
                     potential_centers.append([x, y, z])
-    # print(f'got {len(potential_centers)} center candidates')
 
     if len(potential_centers) == 0:
-        new_stride = [max(1, s // 2) for s in stride]
-        return generate_bounding_boxes(mask, bbox_size, new_stride, margin, max_depth, current_depth + 1)
+        return generate_bounding_boxes(
+            mask, bbox_size,
+            [max(1, s // 2) for s in stride],
+            margin, max_depth, current_depth + 1
+        )
 
-    # Set cover algorithm
-    potential_centers = np.array(potential_centers)
-    uncovered = mask.copy().astype(np.uint8)
+    # Keep as tensor for vectorised center pruning.
+    potential_centers = torch.tensor(potential_centers, device=mask.device)
+    uncovered = mask.clone().byte()
     bboxes = []
 
-    while len(potential_centers) > 0 and np.any(uncovered):
-        best_center = None
+    # Greedy set-cover: evaluate ALL candidates, commit the best, repeat.
+    while len(potential_centers) > 0 and uncovered.any():
+        best_idx     = None   # integer index into potential_centers
         best_covered = 0
-        best_bounds = None
+        best_bounds  = None
 
-        # Find the center that covers the most uncovered voxels
-        for idx, center in enumerate(potential_centers):
-            c_x, c_y, c_z = center
-            x_start = max(0, c_x - half_size[0] + margin[0])
-            x_end = min(mask.shape[0], c_x + end_offset[0] - margin[0])
-            y_start = max(0, c_y - half_size[1] + margin[1])
-            y_end = min(mask.shape[1], c_y + end_offset[1] - margin[1])
-            z_start = max(0, c_z - half_size[2] + margin[2])
-            z_end = min(mask.shape[2], c_z + end_offset[2] - margin[2])
+        for idx in range(len(potential_centers)):
+            center = potential_centers[idx]
+            c_x, c_y, c_z = center[0].item(), center[1].item(), center[2].item()
 
-            region = uncovered[x_start:x_end, y_start:y_end, z_start:z_end]
-            num_covered = np.sum(region)
+            x_start = max(0,             c_x - half_size[0] + margin[0])
+            x_end   = min(mask.shape[0], c_x + end_offset[0] - margin[0])
+            y_start = max(0,             c_y - half_size[1] + margin[1])
+            y_end   = min(mask.shape[1], c_y + end_offset[1] - margin[1])
+            z_start = max(0,             c_z - half_size[2] + margin[2])
+            z_end   = min(mask.shape[2], c_z + end_offset[2] - margin[2])
+
+            num_covered = uncovered[x_start:x_end, y_start:y_end, z_start:z_end].sum().item()
+
             if num_covered > best_covered:
                 best_covered = num_covered
-                best_center = center
-                best_bounds = (x_start, x_end, y_start, y_end, z_start, z_end)
+                best_idx     = idx   # integer — used to index potential_centers tensor
+                best_bounds  = (x_start, x_end, y_start, y_end, z_start, z_end)
 
-            # If no new voxels are covered, stop
-            if best_covered == 0:
-                break
-
-            # Add the best bounding box
-            c_x, c_y, c_z = best_center
-            bboxes.append([
-                [c_x - half_size[0], c_x + end_offset[0]],
-                [c_y - half_size[1], c_y + end_offset[1]],
-                [c_z - half_size[2], c_z + end_offset[2]],
-            ])
-
-            # Mark voxels as covered, respecting the margin
-            x_s, x_e, y_s, y_e, z_s, z_e = best_bounds
-            uncovered[
-                x_s: x_e,
-                y_s: y_e,
-                z_s: z_e,
-            ] = 0
-
-            # Remove the used center from potential_centers
-            potential_centers = np.array([c for c in potential_centers if uncovered[c[0], c[1], c[2]] > 0])
-
-        # Step 5: Recursively cover remaining voxels using uncovered as the mask
-        if np.any(uncovered):
-            if np.sum(uncovered) < np.prod([i // 3 for i in bbox_size]):
-                bboxes.extend(random_sampling_fallback(uncovered, bbox_size, margin, 25))
-            else:
-                new_stride = [max(1, s // 2) for s in stride]
-                bboxes.extend(generate_bounding_boxes(uncovered, bbox_size, new_stride, margin, max_depth, current_depth + 1))
-
-        return bboxes
-
-def random_sampling_fallback(mask: np.array, bbox_size=(192, 192, 192), margin=(10, 10, 10), n_samples: int = 25):
-    half_size = [bs // 2 for bs in bbox_size]
-    # Adjust end offsets to ensure full bbox_size (handles odd sizes)
-    end_offset = [bs - hs for bs, hs in zip(bbox_size, half_size)]  # e.g., 193 - 96 = 97
-
-    bboxes = []
-
-    while np.any(mask):
-        indices = np.argwhere(mask) # nx3
-
-        best_center = None
-        best_covered = 0
-        best_bounds = None
-
-        # Find the center that covers the most uncovered voxels
-        for _ in range(n_samples):
-            idx = np.random.choice(len(indices))
-            center = indices[idx]
-            c_x, c_y, c_z = center
-            x_start = max(0, c_x - half_size[0] + margin[0])
-            x_end = min(mask.shape[0], c_x + end_offset[0] - margin[0])
-            y_start = max(0, c_y - half_size[1] + margin[1])
-            y_end = min(mask.shape[1], c_y + end_offset[1] - margin[1])
-            z_start = max(0, c_z - half_size[2] + margin[2])
-            z_end = min(mask.shape[2], c_z + end_offset[2] - margin[2])
-
-            region = mask[x_start:x_end, y_start:y_end, z_start:z_end]
-            num_covered = region.sum()
-            if num_covered > best_covered:
-                best_covered = num_covered
-                best_center = center
-                best_bounds = (x_start, x_end, y_start, y_end, z_start, z_end)
-            if num_covered > best_covered:
-                best_covered = num_covered
-                best_center = idx
-                best_bounds = (x_start, x_end, y_start, y_end, z_start, z_end)
-        if best_center is None:
+        # No candidate covers any uncovered voxel — done.
+        if best_covered == 0 or best_idx is None:
             break
 
-        # Add the best bounding box
-        c_x, c_y, c_z = best_center
+        # Commit the best box — extract coordinate from tensor by integer index.
+        c_x, c_y, c_z = [i.item() for i in potential_centers[best_idx]]
         bboxes.append([
             [c_x - half_size[0], c_x + end_offset[0]],
             [c_y - half_size[1], c_y + end_offset[1]],
             [c_z - half_size[2], c_z + end_offset[2]],
         ])
 
-        # Mark voxels as covered, respecting the margin
+        # Mark coverage region.
         x_s, x_e, y_s, y_e, z_s, z_e = best_bounds
-        mask[
-            x_s: x_e,
-            y_s: y_e,
-            z_s: z_e,
-        ] = 0
+        uncovered[x_s:x_e, y_s:y_e, z_s:z_e] = 0
+
+        # Prune centers whose voxel is now covered — vectorised via tensor indexing.
+        potential_centers = potential_centers[
+            uncovered[tuple(potential_centers.T)] > 0
+        ]
+
+    # Cover any residual voxels.
+    if uncovered.any():
+        residual = uncovered.sum().item()
+        small_residual = residual < np.prod([i // 3 for i in bbox_size])
+
+        if small_residual:
+            bboxes.extend(
+                random_sampling_fallback(uncovered, bbox_size, margin, n_samples=25)
+            )
+        else:
+            bboxes.extend(
+                generate_bounding_boxes(
+                    uncovered, bbox_size,
+                    [max(1, s // 2) for s in stride],
+                    margin, max_depth, current_depth + 1
+                )
+            )
+
+    return bboxes
+
+
+def random_sampling_fallback(
+        mask: torch.Tensor,
+        bbox_size=(192, 192, 192),
+        margin=(10, 10, 10),
+        n_samples: int = 25
+) -> List:
+    """
+    Cover remaining mask voxels by randomly sampling candidate centers and
+    greedily picking the one that covers the most uncovered voxels.
+
+    Used as a fallback for small residual regions after the main greedy pass,
+    or when max recursion depth is exceeded.
+
+    Parameters
+    ----------
+    mask : torch.Tensor
+        3D binary tensor of uncovered voxels. Modified in place.
+    bbox_size : tuple of int
+        Size of each bounding box.
+    margin : tuple of int
+        Coverage margin (same semantics as generate_bounding_boxes).
+    n_samples : int
+        Number of random candidates to evaluate per iteration.
+
+    Returns
+    -------
+    List of [[x0,x1],[y0,y1],[z0,z1]] bounding boxes.
+    """
+    half_size  = [bs // 2 for bs in bbox_size]
+    end_offset = [bs - hs for bs, hs in zip(bbox_size, half_size)]
+    bboxes = []
+
+    while mask.any():
+        indices = torch.nonzero(mask, as_tuple=False)  # (N, 3)
+
+        best_center  = None
+        best_covered = 0
+        best_bounds  = None
+
+        # Sample without replacement to avoid evaluating the same voxel twice.
+        sample_size = min(n_samples, len(indices))
+        sample_idxs = torch.randperm(len(indices))[:sample_size]
+
+        for idx in sample_idxs:
+            center = indices[idx]
+            c_x, c_y, c_z = center[0].item(), center[1].item(), center[2].item()
+
+            x_start = max(0,             c_x - half_size[0] + margin[0])
+            x_end   = min(mask.shape[0], c_x + end_offset[0] - margin[0])
+            y_start = max(0,             c_y - half_size[1] + margin[1])
+            y_end   = min(mask.shape[1], c_y + end_offset[1] - margin[1])
+            z_start = max(0,             c_z - half_size[2] + margin[2])
+            z_end   = min(mask.shape[2], c_z + end_offset[2] - margin[2])
+
+            num_covered = mask[x_start:x_end, y_start:y_end, z_start:z_end].sum().item()
+
+            if num_covered > best_covered:
+                best_covered = num_covered
+                best_center  = center   # coordinate tensor row, not an integer index
+                best_bounds  = (x_start, x_end, y_start, y_end, z_start, z_end)
+
+        # Guard: if nothing was covered (e.g. all candidates had zero coverage), stop.
+        if best_center is None or best_covered == 0:
+            break
+
+        c_x, c_y, c_z = best_center[0].item(), best_center[1].item(), best_center[2].item()
+        bboxes.append([
+            [c_x - half_size[0], c_x + end_offset[0]],
+            [c_y - half_size[1], c_y + end_offset[1]],
+            [c_z - half_size[2], c_z + end_offset[2]],
+        ])
+
+        x_s, x_e, y_s, y_e, z_s, z_e = best_bounds
+        mask[x_s:x_e, y_s:y_e, z_s:z_e] = 0
+
     return bboxes
 
 
 if __name__ == '__main__':
     times = []
+    torch.set_num_threads(8)
 
-    for _ in range(1):
+    for _ in range(3):
         st = time()
-        mask = np.zeros((256, 256, 256), dtype=np.uint8)
-        mask[50:150, 50:150, 50:150] = 1  # A cubic object
+        mask = torch.zeros((256, 256, 256), dtype=torch.uint8)
+        mask[50:150, 50:150, 50:150] = 1
 
-        # Generate bounding boxes with an odd size to test
-        bboxes = random_sampling_fallback(
+        bboxes = generate_bounding_boxes(
             mask,
-            bbox_size=(193, 193, 193),  # Odd size
+            bbox_size=(192, 192, 192),
+            stride=(16, 16, 16),
             margin=(10, 10, 10),
-            n_samples = 25
         )
-
-        # Print results
         print(f"Number of bounding boxes: {len(bboxes)}")
-        end = time()
-        times.append(end - st)
-    print(times)
+        times.append(time() - st)
+
+    print(f"Times: {times}")
+    print(f"Mean: {sum(times)/len(times):.3f}s")

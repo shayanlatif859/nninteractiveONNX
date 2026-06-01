@@ -1,7 +1,5 @@
 from math import ceil, floor
 
-print("rounding is being used here!!")
-
 def round_to_nearest_odd(number: float):
     assert number > 0
     cl = ceil(number)

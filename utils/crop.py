@@ -1,39 +1,10 @@
 from typing import Sequence
-import numpy as np
+import torch
+import torch.nn.functional as F
 
-print("crop is being used here")
-
-def crop_and_pad_into_buffer(target_tensor: np.ndarray,
-                                bbox: Sequence[Sequence[int]],
-                                source_tensor: np.ndarray) -> None:
-    total_dims = source_tensor.ndim
-    bbox_dims = len(bbox)
-    leading_dims = total_dims - bbox_dims
-
-    source_slices = []
-    target_slices = []
-
-    for _ in range(leading_dims):
-        source_slices.append(slice(None))
-        target_slices.append(slice(None))
-
-    for d in range(bbox_dims):
-        box_start, box_end = bbox[d]
-        d_source = leading_dims + d
-        source_size = source_tensor.shape[d_source]
-
-        copy_start_source = max(box_start, 0)
-        copy_end_source = min(box_end, source_size)
-        copy_size = copy_end_source - copy_start_source
-
-        copy_start_target = max(0, -box_start)
-        copy_end_target = copy_start_target + copy_size
-
-        source_slices.append(slice(copy_start_source, copy_end_source))
-        target_slices.append(slice(copy_start_target, copy_end_target))
-
-    sub_source = source_tensor[tuple(source_slices)]
-    target_tensor[tuple(target_slices)] = sub_source
+def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
+                             bbox: Sequence[Sequence[int]],
+                             source_tensor: torch.Tensor) -> None:
     """
     Copies a sub-region from source_tensor into target_tensor based on a bounding box.
 
@@ -54,9 +25,46 @@ def crop_and_pad_into_buffer(target_tensor: np.ndarray,
         If source_tensor and target_tensor are on different devices, only the overlapping subregion
         is transferred to the device of target_tensor.
     """
+    total_dims = source_tensor.ndim
+    bbox_dims = len(bbox)
+    # Compute the number of leading dims that are not covered by bbox.
+    leading_dims = total_dims - bbox_dims
+
+    source_slices = []
+    target_slices = []
+
+    # For the leading dimensions, include the entire dimension.
+    for _ in range(leading_dims):
+        source_slices.append(slice(None))
+        target_slices.append(slice(None))
+
+    # Process the dimensions covered by the bbox.
+    for d in range(bbox_dims):
+        box_start, box_end = bbox[d]
+        d_source = leading_dims + d
+        source_size = source_tensor.shape[d_source]
+
+        # Compute the overlapping region in source coordinates.
+        copy_start_source = max(box_start, 0)
+        copy_end_source = min(box_end, source_size)
+        copy_size = copy_end_source - copy_start_source
+
+        # Compute the corresponding indices in the target tensor.
+        copy_start_target = max(0, -box_start)
+        copy_end_target = copy_start_target + copy_size
+
+        source_slices.append(slice(copy_start_source, copy_end_source))
+        target_slices.append(slice(copy_start_target, copy_end_target))
+
+    # Extract the overlapping region from the source.
+    sub_source = source_tensor[tuple(source_slices)]
+    # Transfer only this subregion to the target tensor's device.
+    sub_source = sub_source.to(target_tensor.device) if isinstance(target_tensor, torch.Tensor) else sub_source.cpu()
+    # Write the data into the preallocated target_tensor.
+    target_tensor[tuple(target_slices)] = sub_source
 
 
-def paste_tensor(target: np.ndarray, source: np.ndarray, bbox):
+def paste_tensor(target: torch.Tensor, source: torch.Tensor, bbox):
     """
     Paste a source tensor into a target tensor using a given bounding box.
 
@@ -100,20 +108,30 @@ def paste_tensor(target: np.ndarray, source: np.ndarray, bbox):
         s_start = t_start - b0
         s_end = s_start + (t_end - t_start)
 
-        s_start = t_start - b0
-        s_end = s_start + (t_end - t_start)
-
         target_indices.append((t_start, t_end))
         source_indices.append((s_start, s_end))
 
-    slices_target = tuple(slice(t0, t1) for t0, t1 in target_indices)
-    slices_source = tuple(slice(s0, s1) for s0, s1 in source_indices)
-    target[slices_target] = source[slices_source]
+    # Paste the corresponding region from source into target.
+    if isinstance(target, torch.Tensor):
+        target[target_indices[0][0]:target_indices[0][1],
+        target_indices[1][0]:target_indices[1][1],
+        target_indices[2][0]:target_indices[2][1]] = \
+            source[source_indices[0][0]:source_indices[0][1],
+            source_indices[1][0]:source_indices[1][1],
+            source_indices[2][0]:source_indices[2][1]].to(target.device)
+    else:
+        target[target_indices[0][0]:target_indices[0][1],
+        target_indices[1][0]:target_indices[1][1],
+        target_indices[2][0]:target_indices[2][1]] = \
+            source[source_indices[0][0]:source_indices[0][1],
+            source_indices[1][0]:source_indices[1][1],
+            source_indices[2][0]:source_indices[2][1]].cpu()
 
     return target
 
 
-def crop_to_valid(img: np.ndarray, bbox):
+
+def crop_to_valid(img: torch.Tensor, bbox):
     """
     Crops the image to the part of the bounding box that lies within the image.
     Supports a 4D tensor of shape (C, X, Y, Z). The bounding box is specified as
@@ -155,7 +173,7 @@ def crop_to_valid(img: np.ndarray, bbox):
     return cropped, pad
 
 
-def pad_cropped(cropped: np.ndarray, pad):
+def pad_cropped(cropped: torch.Tensor, pad):
     """
     Pads the cropped image using the given pad amounts.
     Supports a 4D tensor of shape (C, X, Y, Z) and applies padding only on the spatial dimensions.
@@ -173,7 +191,17 @@ def pad_cropped(cropped: np.ndarray, pad):
         padded (torch.Tensor): Padded tensor of shape (C, desired_x, desired_y, desired_z),
                                where the spatial dimensions match the bbox size.
     """
+    # F.pad for 3D data expects a 5D input (N, C, X, Y, Z) and a pad tuple of length 6:
+    # (pad_z_left, pad_z_right, pad_y_left, pad_y_right, pad_x_left, pad_x_right)
+    need_unsqueeze = (cropped.dim() == 4)
+    if need_unsqueeze:
+        cropped = cropped.unsqueeze(0)  # Now shape is (1, C, X, Y, Z)
 
-    pad_np = [(0, 0)] + pad  # First is for channel dim
-    padded = np.pad(cropped, pad_np, mode='constant')
+    # Reverse the pad list (currently in order x, y, z) to match F.pad's expected order: z, y, x.
+    pad_rev = pad[::-1]
+    pad_flat = [p for pair in pad_rev for p in pair]
+    padded = F.pad(cropped, pad_flat)
+
+    if need_unsqueeze:
+        padded = padded.squeeze(0)
     return padded

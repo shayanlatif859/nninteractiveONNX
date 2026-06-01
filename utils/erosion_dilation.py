@@ -1,13 +1,12 @@
-
-import numpy as np
-from scipy.ndimage import maximum_filter, minimum_filter
+import torch
+import torch.nn.functional as F
 
 from nnunetv2.utilities.helpers import empty_cache
+from torch.backends import cudnn
 
-print("erosion_dilation is being used here!!")
 
-def iterative_3x3_same_padding_pool3d(x, kernel_size=3, use_min_pool=False):
-    assert kernel_size % 2 == 1, 'Only works with odd kernels'
+@torch.inference_mode()
+def iterative_3x3_same_padding_pool3d(x, kernel_size: int, use_min_pool: bool = False):
     """
     Applies 3D max pooling with manual asymmetric padding such that
     the output shape is the same as the input shape.
@@ -20,7 +19,10 @@ def iterative_3x3_same_padding_pool3d(x, kernel_size=3, use_min_pool=False):
     Returns:
         Tensor: Output tensor with the same (D, H, W) dimensions as the input.
     """
+    benchmark = cudnn.benchmark
+    cudnn.benchmark = False
 
+    assert kernel_size % 2 == 1, 'Only works with odd kernels'
 
     # Compute asymmetric padding for each dimension:
     pad_front = (kernel_size - 1) // 2
@@ -29,21 +31,21 @@ def iterative_3x3_same_padding_pool3d(x, kernel_size=3, use_min_pool=False):
 
     # For 3D (input shape: [N, C, D, H, W]), F.pad expects the padding in the order:
     # (pad_left, pad_right, pad_top, pad_bottom, pad_front, pad_back)
-    # Removed .pad
+    x = F.pad(x, (pad_front, pad_back,
+                         pad_front, pad_back,
+                         pad_front, pad_back), mode='replicate')
 
     iters = (kernel_size - 1) // 2
-
-    # Handle edge replication padding manually:
-    pad_width = iters
-    x_padded = np.pad(x, ((0, 0), (0, 0), (pad_width, pad_width), (pad_width, pad_width), (pad_width, pad_width)),
-            mode='edge')
-
     # Apply max pooling with no additional padding.
     if not use_min_pool:
         for _ in range(iters):
-            x_padded = maximum_filter(x_padded, size=(1, 1, 3, 3, 3))
-        return x_padded
+            x = F.max_pool3d(x, kernel_size=3, stride=1, padding=0)
+        empty_cache(x.device)
+        cudnn.benchmark = benchmark
+        return x
     else:
         for _ in range(iters):
-            x_padded = minimum_filter(x_padded, size=(1, 1, 3, 3, 3))
-        return x_padded
+            x = - F.max_pool3d(- x, kernel_size=3, stride=1, padding=0)
+        empty_cache(x.device)
+        cudnn.benchmark = benchmark
+        return x
